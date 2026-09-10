@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#faf6f0">
+<title>我们的日记</title>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📖</text></svg>">
+</head>
+<body>
+
+<!-- ============ 首次连接配置 ============ -->
+<div id="setup" class="setup">
+  <div class="setup-card">
+    <div class="setup-logo">📖</div>
+    <h1>我们的日记</h1>
+    <p class="setup-sub">两个人的共同日记本。第一次打开需要连接一次数据仓库，之后这台设备就记住了。</p>
+
+    <div class="field">
+      <label for="sOwner">GitHub 用户名</label>
+      <input id="sOwner" type="text" autocomplete="username" spellcheck="false" placeholder="例如 zhangsan">
+    </div>
+    <div class="field">
+      <label for="sRepo">数据仓库名</label>
+      <input id="sRepo" type="text" spellcheck="false" placeholder="例如 our-diary-data">
+    </div>
+    <div class="field">
+      <label for="sToken">访问令牌（Personal Access Token）</label>
+      <input id="sToken" type="password" autocomplete="off" spellcheck="false" placeholder="ghp_ 或 github_pat_ 开头">
+      <p class="hint">只保存在你这台设备的浏览器里，不会上传到任何地方。令牌只需对该数据仓库有 Contents 读写权限。</p>
+    </div>
+
+    <button id="sConnect" class="btn primary big">连接</button>
+    <div id="setupError" class="setup-error hidden"></div>
+  </div>
+</div>
+
+<!-- ============ 主界面 ============ -->
+<div id="app" class="app hidden">
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">📖</span>
+      <span class="brand-text">我们的日记</span>
+    </div>
+    <div class="topbar-actions">
+      <button id="syncBtn" class="icon-btn" title="立即同步" aria-label="立即同步">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>
+      </button>
+      <button id="settingsBtn" class="icon-btn" title="设置" aria-label="设置">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <div class="identity">
+    <span>正在以</span>
+    <button id="identityChip" class="identity-chip">—</button>
+    <span>的身份记录</span>
+  </div>
+
+  <section class="card calendar">
+    <div class="cal-head">
+      <button id="prevMonth" class="icon-btn" aria-label="上个月">‹</button>
+      <div id="calTitle" class="cal-title"></div>
+      <button id="nextMonth" class="icon-btn" aria-label="下个月">›</button>
+    </div>
+    <div class="cal-week">
+      <span>日</span><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span>
+    </div>
+    <div id="calGrid" class="cal-grid"></div>
+    <div class="cal-foot">
+      <button id="todayBtn" class="chip-btn">回到今天</button>
+      <button id="allBtn" class="chip-btn">看全部</button>
+    </div>
+  </section>
+
+  <section class="entries">
+    <div id="listHead" class="list-head"></div>
+    <div id="entryList" class="entry-list"></div>
+    <div id="emptyState" class="empty hidden">
+      <div class="empty-emoji">🌱</div>
+      <div id="emptyText">这一天还没有日记。</div>
+      <button id="emptyWrite" class="chip-btn">写下第一篇</button>
+    </div>
+  </section>
+
+  <button id="composeFab" class="fab">
+    <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+    <span>写日记</span>
+  </button>
+</div>
+
+<!-- ============ 写 / 编辑 抽屉 ============ -->
+<div id="composeSheet" class="sheet hidden" role="dialog" aria-modal="true">
+  <div class="sheet-panel">
+    <div class="sheet-head">
+      <button id="cancelCompose" class="sheet-btn">取消</button>
+      <div id="composeHeading" class="sheet-title">写日记</div>
+      <button id="saveCompose" class="sheet-btn primary">保存</button>
+    </div>
+    <div class="sheet-body">
+      <div class="field">
+        <label for="fDate">日期</label>
+        <input id="fDate" type="date">
+      </div>
+      <div class="field">
+        <label for="fTitle">标题 <span class="opt">（可选）</span></label>
+        <input id="fTitle" type="text" maxlength="120" placeholder="给这一天起个名字">
+      </div>
+      <div class="field grow">
+        <label for="fContent">正文</label>
+        <textarea id="fContent" placeholder="今天发生了什么…"></textarea>
+      </div>
+      <div class="field">
+        <label>以谁的身份</label>
+        <div class="author-pick">
+          <button id="pickA" class="author-opt" data-author="a"></button>
+          <button id="pickB" class="author-opt" data-author="b"></button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 设置抽屉 ============ -->
+<div id="settingsSheet" class="sheet hidden" role="dialog" aria-modal="true">
+  <div class="sheet-panel">
+    <div class="sheet-head">
+      <span></span>
+      <div class="sheet-title">设置</div>
+      <button id="closeSettings" class="sheet-btn">完成</button>
+    </div>
+    <div class="sheet-body">
+      <div class="set-group">
+        <div class="set-label">两位作者</div>
+        <div class="author-row">
+          <input type="color" id="nameAColor" class="color-input" aria-label="作者一颜色">
+          <input type="text" id="nameA" class="name-input" maxlength="24" placeholder="作者一昵称">
+        </div>
+        <div class="author-row">
+          <input type="color" id="nameBColor" class="color-input" aria-label="作者二颜色">
+          <input type="text" id="nameB" class="name-input" maxlength="24" placeholder="作者二昵称">
+        </div>
+        <button id="saveNames" class="btn">保存昵称与颜色</button>
+      </div>
+
+      <div class="set-group">
+        <div class="set-label">这台设备的身份</div>
+        <div class="author-pick">
+          <button id="setAsA" class="author-opt" data-author="a"></button>
+          <button id="setAsB" class="author-opt" data-author="b"></button>
+        </div>
+      </div>
+
+      <div class="set-group">
+        <div class="set-label">备份</div>
+        <button id="exportBtn" class="btn">导出全部日记（JSON）</button>
+        <label class="btn import-label">
+          导入备份（合并，不删除现有）
+          <input id="importFile" type="file" accept=".json,application/json" hidden>
+        </label>
+      </div>
+
+      <div class="set-group">
+        <div class="set-label">统计</div>
+        <div id="statsBox" class="stats"></div>
+      </div>
+
+      <div class="set-group">
+        <div class="set-label">连接</div>
+        <div id="connInfo" class="conn-info"></div>
+        <button id="resetConn" class="btn danger">断开并清除本机令牌</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="connBanner" class="conn-banner hidden"></div>
+<div id="toast" class="toast hidden"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
