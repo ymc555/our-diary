@@ -106,8 +106,26 @@ function normEntry(e) {
     createdAt: String(e.createdAt || new Date().toISOString()),
     updatedAt: String(e.updatedAt || e.createdAt || new Date().toISOString()),
     edited: !!e.edited,
-    deleted: !!e.deleted
+    deleted: !!e.deleted,
+    comments: Array.isArray(e.comments) ? e.comments.map(normComment) : []
   };
+}
+function normComment(c) {
+  return {
+    id: String(c.id || newId()),
+    para: Math.max(0, parseInt(c.para, 10) || 0),
+    author: c.author === 'b' ? 'b' : 'a',
+    text: String(c.text || '').slice(0, 500),
+    createdAt: String(c.createdAt || new Date().toISOString())
+  };
+}
+function mergeComments(x, y) {
+  const m = new Map();
+  for (const c of [...(x || []), ...(y || [])]) {
+    const n = normComment(c);
+    if (!m.has(n.id)) m.set(n.id, n);
+  }
+  return [...m.values()].sort((p, q) => (p.createdAt || '').localeCompare(q.createdAt || ''));
 }
 function sortEntries(list) {
   return list.slice().sort((p, q) =>
@@ -120,7 +138,10 @@ function mergeStates(x, y) {
   for (const e of [...(x.entries || []), ...(y.entries || [])].map(normEntry)) {
     if (!e.id) continue;
     const prev = byId.get(e.id);
-    if (!prev || (e.updatedAt || '') > (prev.updatedAt || '')) byId.set(e.id, e);
+    if (!prev) { byId.set(e.id, e); continue; }
+    const base = (e.updatedAt || '') > (prev.updatedAt || '') ? e : prev;
+    base.comments = mergeComments(prev.comments, e.comments);
+    byId.set(e.id, base);
   }
   const pickY = (y.authorsRev || '') >= (x.authorsRev || '');
   return {
@@ -402,14 +423,30 @@ function entryCard(e) {
   card.style.borderLeftColor = au.color;
 
   const rel = relLabel(e.date);
+  const paras = String(e.content || '').split('\n');
+  const parasHtml = paras.map((p, i) => {
+    const comments = (e.comments || []).filter(c => c.para === i);
+    return `<div class="para" data-para="${i}">
+      <div class="para-text">${esc(p) || '&nbsp;'}</div>
+      <div class="para-actions">
+        <button class="para-comment-btn" data-para="${i}">留言${comments.length ? ` ${comments.length}` : ''}</button>
+      </div>
+      <div class="para-comments">${comments.map(c => commentHtml(c)).join('')}</div>
+      <div class="para-input hidden" data-input="${i}">
+        <input type="text" maxlength="500" placeholder="对这段话留言…">
+        <button class="send" data-para="${i}">发送</button>
+      </div>
+    </div>`;
+  }).join('');
+
   card.innerHTML = `
     <div class="e-top">
       <span class="e-author" style="background:${esc(au.color)}">${esc(au.name)}</span>
       <span class="e-date">${esc(prettyDate(e.date))}</span>
       ${rel ? `<span class="e-rel">${esc(rel)}</span>` : ''}
     </div>
-    ${e.title ? `<div class="e-title">${esc(e.title)}</div>` : ''}
-    <div class="e-content">${esc(e.content)}</div>
+    ${e.title ? `<div class="e-title" style="color:${esc(au.color)}">${esc(e.title)}</div>` : ''}
+    <div class="e-content" style="color:${esc(au.color)}">${parasHtml}</div>
     <div class="e-meta">
       <span>${esc(clockTime(e.createdAt))} 写下${e.edited ? ` · ${esc(clockTime(e.updatedAt))} 编辑过` : ''}</span>
       <span class="spacer"></span>
@@ -419,7 +456,67 @@ function entryCard(e) {
 
   card.querySelector('[data-act="edit"]').addEventListener('click', () => openCompose(e));
   card.querySelector('[data-act="del"]').addEventListener('click', () => removeEntry(e));
+
+  card.querySelectorAll('.para-comment-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const row = card.querySelector(`.para-input[data-input="${btn.dataset.para}"]`);
+      row.classList.toggle('hidden');
+      if (!row.classList.contains('hidden')) row.querySelector('input').focus();
+    });
+  });
+  card.querySelectorAll('.para-input .send').forEach(btn => {
+    const submit = async () => {
+      const row = btn.closest('.para-input');
+      const input = row.querySelector('input');
+      const text = input.value.trim();
+      if (!text) return;
+      await addComment(e, parseInt(btn.dataset.para, 10), text);
+    };
+    btn.addEventListener('click', submit);
+    btn.parentElement.querySelector('input').addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') { ev.preventDefault(); submit(); }
+    });
+  });
   return card;
+}
+
+function commentHtml(c) {
+  const au = state.authors[c.author];
+  return `<div class="comment" style="border-left-color:${esc(au.color)}">
+    <div class="c-head">
+      <span class="c-author" style="color:${esc(au.color)}">${esc(au.name)}</span>
+      <span class="c-time">${esc(fmtStamp(c.createdAt))}</span>
+    </div>
+    <div class="c-text">${esc(c.text)}</div>
+  </div>`;
+}
+
+function fmtStamp(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d)) return '';
+  const day = keyOf(d);
+  const t = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  if (day === todayKey()) return `今天 ${t}`;
+  const rel = relLabel(day);
+  if (rel) return `${rel} ${t}`;
+  return `${d.getMonth() + 1}月${d.getDate()}日 ${t}`;
+}
+
+async function addComment(e, paraIdx, text) {
+  e.comments = e.comments || [];
+  e.comments.push(normComment({ id: newId(), para: paraIdx, author: me, text, createdAt: new Date().toISOString() }));
+  e.comments = mergeComments(e.comments, []);
+  e.updatedAt = new Date().toISOString();
+  state.entries = sortEntries(state.entries);
+  render();
+  try {
+    await push(`留言于 ${e.date} 的日记`);
+    showToast('留言已发送');
+    render();
+  } catch (err) {
+    showConnBanner('留言失败：' + err.message);
+  }
 }
 
 function renderSettingsInfo() {
@@ -730,9 +827,15 @@ function bind() {
     }
   });
 
+  const wakeSync = () => {
+    remoteEtag = null;
+    silentSync();
+  };
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') silentSync();
+    if (document.visibilityState === 'visible') wakeSync();
   });
+  window.addEventListener('focus', wakeSync);
+  window.addEventListener('pageshow', wakeSync);
 }
 
 bind();
