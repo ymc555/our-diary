@@ -7,6 +7,7 @@
 const LS_CFG   = 'ourdiary.cfg';      // { owner, repo, token }
 const LS_ME    = 'ourdiary.me';       // 'a' | 'b'
 const LS_CACHE = 'ourdiary.cache';    // 最近一次已知状态，用于秒开
+const SS_UNLOCK = 'ourdiary.unlock';  // 本次会话已解锁的密码指纹（sessionStorage：关掉重开就要重输）
 
 const DATA_PATH = 'diary.json';
 const POLL_MS   = 30000;
@@ -162,13 +163,16 @@ function mergeStates(x, y) {
     byId.set(e.id, base);
   }
   const win = pickAuthorsSide(x, y);
-  return {
+  const lock = mergeLock(x, y);
+  const out = {
     version: 1,
     authorsRev: win.authorsRev || '',
     authorsTouched: !!(x.authorsTouched || y.authorsTouched),
     authors: normAuthors(win.authors),
     entries: sortEntries([...byId.values()])
   };
+  if (lock) out.lock = lock;
+  return out;
 }
 function liveEntries() {
   return (state.entries || []).filter(e => !e.deleted);
@@ -186,7 +190,137 @@ function pruneTombstones() {
 function hasOwnContent() {
   const s = state || {};
   if ((s.entries || []).length) return true;
+  if (normLock(s.lock)) return true;
   return !!s.authorsTouched || !isDefaultAuthors(s.authors);
+}
+
+/* ---------------- 密码锁 ---------------- */
+// 密码只以"加盐 SHA-256"的形式存在私有数据仓库里，公开的网页源码中没有密码。
+async function sha256Hex(text) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+function newSalt() {
+  const a = new Uint8Array(8);
+  crypto.getRandomValues(a);
+  return [...a].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+function hashPassword(salt, pass) { return sha256Hex(`${salt}:${pass}`); }
+function normLock(l) {
+  if (!l || typeof l !== 'object') return null;
+  const hash = String(l.hash || '').toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(hash)) return null;
+  return { salt: String(l.salt || ''), hash, rev: String(l.rev || '') };
+}
+function mergeLock(x, y) {
+  const a = normLock(x && x.lock), b = normLock(y && y.lock);
+  if (!a) return b;
+  if (!b) return a;
+  return (b.rev || '') >= (a.rev || '') ? b : a;
+}
+function lockFingerprint() {
+  const l = normLock(state && state.lock);
+  return l ? l.hash : '';
+}
+function isSessionUnlocked() {
+  const fp = lockFingerprint();
+  if (!fp) return true;
+  try { return sessionStorage.getItem(SS_UNLOCK) === fp; } catch (e) { return false; }
+}
+function markUnlocked() {
+  const fp = lockFingerprint();
+  if (!fp) return;
+  try { sessionStorage.setItem(SS_UNLOCK, fp); } catch (e) { /* 隐私模式写不进，那就每次都问 */ }
+}
+function needLock() {
+  return !!normLock(state && state.lock) && !isSessionUnlocked();
+}
+
+function shake(el) {
+  el.classList.remove('shake');
+  void el.offsetWidth;
+  el.classList.add('shake');
+}
+function showLock() {
+  $('#setup').classList.add('hidden');
+  $('#app').classList.add('hidden');
+  $('#lockError').classList.add('hidden');
+  // 上锁时清掉已经渲染出来的内容，别留在页面里
+  $('#entryList').innerHTML = '';
+  $('#listHead').innerHTML = '';
+  $('#calGrid').innerHTML = '';
+  $('#lock').classList.remove('hidden');
+  const i = $('#lkPass');
+  i.value = '';
+  setTimeout(() => i.focus(), 60);
+}
+async function enterApp() {
+  $('#lock').classList.add('hidden');
+  showApp();
+  render();
+  startPolling();
+  try {
+    await pull();
+    hideConnBanner();
+    render();
+  } catch (e) {
+    showConnBanner('同步失败：' + e.message + '（显示的是本机缓存）');
+  }
+}
+async function tryUnlock() {
+  const lock = normLock(state && state.lock);
+  if (!lock) { await enterApp(); return; }
+  const errBox = $('#lockError');
+  const pass = $('#lkPass').value;
+  const btn = $('#lkUnlock');
+  const fail = (msg) => {
+    errBox.textContent = msg;
+    errBox.classList.remove('hidden');
+    shake($('#lock'));
+    $('#lkPass').value = '';
+    $('#lkPass').focus();
+  };
+  if (!crypto.subtle) { fail('当前浏览器不支持加密校验，请用 https 打开本页。'); return; }
+  if (!pass) { shake($('#lock')); return; }
+  btn.disabled = true; btn.textContent = '校验中…';
+  try {
+    let ok = await hashPassword(lock.salt, pass) === lock.hash;
+    if (!ok) {
+      // 本机缓存的密码可能已被对方改掉：联网再确认一次；读不到就按缓存判定
+      try {
+        remoteEtag = null;
+        const got = await loadRemote({ fresh: true });
+        if (!got.missing && !got.unchanged) {
+          state = mergeStates(got.state, state);
+          saveCache();
+          const fresh = normLock(state.lock);
+          if (fresh) ok = await hashPassword(fresh.salt, pass) === fresh.hash;
+        }
+      } catch (e) { /* 离线时用本机缓存判定 */ }
+    }
+    if (ok) { markUnlocked(); await enterApp(); return; }
+    fail('密码不对。');
+  } finally {
+    btn.disabled = false; btn.textContent = '打开';
+  }
+}
+async function saveLock() {
+  const p1 = $('#lkNew').value;
+  const p2 = $('#lkNew2').value;
+  if (!p1) { showToast('先输入新密码'); return; }
+  if (p1.length < 4) { showToast('密码至少 4 位'); return; }
+  if (p1 !== p2) { showToast('两次输入的密码不一样'); return; }
+  if (!crypto.subtle) { showToast('当前浏览器不支持加密，请用 https 打开本页'); return; }
+  const salt = newSalt();
+  state.lock = { salt, hash: await hashPassword(salt, p1), rev: new Date().toISOString() };
+  $('#lkNew').value = ''; $('#lkNew2').value = '';
+  markUnlocked();
+  renderSettingsInfo();
+  try {
+    await push('更新打开密码');
+    markUnlocked();
+    showToast('密码已保存，两台设备同时生效');
+  } catch (e) { showConnBanner('保存失败：' + e.message); }
 }
 
 /* ---------------- GitHub API ---------------- */
@@ -574,6 +708,10 @@ function renderSettingsInfo() {
 
   $('#connInfo').textContent = cfg ? `${cfg.owner}/${cfg.repo} · ${DATA_PATH}` : '';
 
+  $('#lockState').textContent = normLock(state.lock)
+    ? '已设置：每次打开都要输密码，两台设备共用同一个密码。'
+    : '未设置：连上数据仓库的设备可以直接看到日记。';
+
   paintAuthorOpts();
 }
 
@@ -704,6 +842,7 @@ function resetConn() {
   if (!confirm('清除这台设备上的令牌与缓存？日记数据仍在 GitHub 仓库里。')) return;
   localStorage.removeItem(LS_CFG);
   localStorage.removeItem(LS_CACHE);
+  try { sessionStorage.removeItem(SS_UNLOCK); } catch (e) { /* ignore */ }
   location.reload();
 }
 
@@ -729,6 +868,7 @@ function setSyncing(on) {
 /* ---------------- 启动 ---------------- */
 function showApp() {
   $('#setup').classList.add('hidden');
+  $('#lock').classList.add('hidden');
   $('#app').classList.remove('hidden');
 }
 function showSetup() {
@@ -760,22 +900,34 @@ async function boot() {
   const cached = loadCache();
   try { cfg = JSON.parse(localStorage.getItem(LS_CFG) || 'null'); } catch (e) { cfg = null; }
 
-  if (cfg && cfg.token) {
-    if (cached) { state = cached.state; remoteSha = cached.sha; showApp(); render(); }
-    else { state = defaultState(); showApp(); }
-    try {
-      const changed = await pull();
-      hideConnBanner();
-      render();
-      startPolling();
-      if (changed && !cached) showToast('已连接');
-    } catch (e) {
+  if (!(cfg && cfg.token)) { showSetup(); return; }
+
+  state = cached ? cached.state : defaultState();
+  if (cached) remoteSha = cached.sha;
+
+  // 本机已知设了密码：先挡住界面，密码对了才显示日记
+  if (needLock()) { showLock(); return; }
+
+  if (cached) { showApp(); render(); }
+
+  try {
+    const changed = await pull();
+    hideConnBanner();
+    // 同步后才发现对方设了密码：立刻挡住
+    if (needLock()) { showLock(); return; }
+    showApp();
+    render();
+    startPolling();
+    if (changed && !cached) showToast('已连接');
+  } catch (e) {
+    if (cached) {
       showConnBanner('连接失败：' + e.message + '（显示的是本机缓存）');
-      if (!cached) showSetup();
+      showApp(); render(); startPolling();
+    } else {
+      showConnBanner('连接失败：' + e.message);
+      showSetup();
     }
-    return;
   }
-  showSetup();
 }
 
 /* ---------------- 事件绑定 ---------------- */
@@ -797,8 +949,9 @@ function bind() {
       await connect(owner, repo, token);
       const now = new Date();
       calYear = now.getFullYear(); calMonth = now.getMonth();
-      showApp(); render(); startPolling();
       showToast('连接成功');
+      if (needLock()) showLock();
+      else { showApp(); render(); startPolling(); }
     } catch (e) {
       errBox.textContent = e.message;
       errBox.classList.remove('hidden');
@@ -850,6 +1003,10 @@ function bind() {
     ev.target.value = '';
   });
   $('#resetConn').addEventListener('click', resetConn);
+
+  $('#lkUnlock').addEventListener('click', tryUnlock);
+  $('#lkPass').addEventListener('keydown', (ev) => { if (ev.key === 'Enter') tryUnlock(); });
+  $('#saveLock').addEventListener('click', saveLock);
 
   $('#syncBtn').addEventListener('click', async () => {
     setSyncing(true);
