@@ -271,9 +271,60 @@ input, textarea { font-family: inherit; font-size: 16px; color: var(--ink); }
 .entry .e-title { font-size: 16px; font-weight: 700; margin: 2px 0 4px; }
 .entry .e-content {
   font-size: 15px;
-  white-space: pre-wrap;
   word-break: break-word;
+}
+.entry .para { padding: 1px 0; }
+.entry .para-text { white-space: pre-wrap; }
+.entry .para-actions { margin-top: 1px; }
+.para-comment-btn {
+  border: none;
+  background: transparent;
+  color: var(--ink-soft);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 8px;
+  border-radius: 8px;
+  opacity: .75;
+}
+.para-comment-btn:active { background: rgba(0,0,0,.06); opacity: 1; }
+.para-comments {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 4px 0 2px;
+}
+.para-comments:empty { display: none; }
+.comment {
+  background: #f6efe6;
+  border-left: 3px solid var(--a);
+  border-radius: 10px;
+  padding: 6px 10px;
+  font-size: 13px;
   color: #4a4038;
+}
+.comment .c-head { display: flex; align-items: baseline; gap: 8px; }
+.comment .c-author { font-weight: 700; }
+.comment .c-time { color: var(--ink-soft); font-size: 11px; }
+.comment .c-text { white-space: pre-wrap; word-break: break-word; }
+.para-input { display: flex; gap: 6px; margin: 6px 0 2px; }
+.para-input input {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+  outline: none;
+  font-size: 14px;
+}
+.para-input .send {
+  border: none;
+  background: var(--ink);
+  color: #fff;
+  border-radius: 10px;
+  padding: 8px 14px;
+  font-size: 13px;
+  cursor: pointer;
 }
 .entry .e-meta {
   display: flex;
