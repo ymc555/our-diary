@@ -504,3 +504,18 @@ input, textarea { font-family: inherit; font-size: 16px; color: var(--ink); }
   .app { padding: 0 20px 110px; }
   .fab { right: calc(50% - 300px); }
 }
+
+/* ---------------- 密码锁 ---------------- */
+#lock .setup-logo { font-size: 40px; }
+#lock .field input {
+  text-align: center;
+  letter-spacing: 8px;
+  font-size: 20px;
+}
+.shake { animation: shake .34s cubic-bezier(.36, .07, .19, .97); }
+@keyframes shake {
+  10%, 90% { transform: translateX(-2px); }
+  20%, 80% { transform: translateX(4px); }
+  30%, 50%, 70% { transform: translateX(-7px); }
+  40%, 60% { transform: translateX(7px); }
+}
