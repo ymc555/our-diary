@@ -73,16 +73,34 @@ function b64decodeUtf8(b64) {
 }
 
 /* ---------------- 状态与合并 ---------------- */
+const DEF_AUTHORS = {
+  a: { name: '小满', color: '#d97757' },
+  b: { name: '小谷', color: '#4a7fa5' }
+};
 function defaultState() {
   return {
     version: 1,
-    authorsRev: new Date().toISOString(),
-    authors: {
-      a: { name: '小满', color: '#d97757' },
-      b: { name: '小谷', color: '#4a7fa5' }
-    },
+    // 空字符串：刚开机的设备对昵称没有任何主张，不能压过对方设置好的名字
+    authorsRev: '',
+    authorsTouched: false,
+    authors: { a: Object.assign({}, DEF_AUTHORS.a), b: Object.assign({}, DEF_AUTHORS.b) },
     entries: []
   };
+}
+function isDefaultAuthors(a) {
+  return ['a', 'b'].every(k => {
+    const s = (a || {})[k] || {};
+    return s.name === DEF_AUTHORS[k].name && s.color === DEF_AUTHORS[k].color;
+  });
+}
+// 该采信哪一方的昵称：手动改过的压过从没改过的；改过的之间再比时间。
+// 关键是"没人动过的默认名"永远不能覆盖对方真正设置的名字。
+function pickAuthorsSide(x, y) {
+  const xt = !!x.authorsTouched, yt = !!y.authorsTouched;
+  if (xt !== yt) return yt ? y : x;
+  const xd = isDefaultAuthors(x.authors), yd = isDefaultAuthors(y.authors);
+  if (xd !== yd) return yd ? x : y;
+  return (y.authorsRev || '') >= (x.authorsRev || '') ? y : x;
 }
 function normAuthors(a) {
   const d = defaultState().authors;
@@ -143,11 +161,12 @@ function mergeStates(x, y) {
     base.comments = mergeComments(prev.comments, e.comments);
     byId.set(e.id, base);
   }
-  const pickY = (y.authorsRev || '') >= (x.authorsRev || '');
+  const win = pickAuthorsSide(x, y);
   return {
     version: 1,
-    authorsRev: (pickY ? y.authorsRev : x.authorsRev) || new Date().toISOString(),
-    authors: normAuthors(pickY ? y.authors : x.authors),
+    authorsRev: win.authorsRev || '',
+    authorsTouched: !!(x.authorsTouched || y.authorsTouched),
+    authors: normAuthors(win.authors),
     entries: sortEntries([...byId.values()])
   };
 }
@@ -161,6 +180,13 @@ function pruneTombstones() {
     const t = Date.parse(e.updatedAt);
     return isNaN(t) || t > cutoff;
   });
+}
+// 本地是否真有内容（日记，或改过的作者名/颜色）。
+// 只有为 true 时才允许在远端没有数据文件的情况下创建它。
+function hasOwnContent() {
+  const s = state || {};
+  if ((s.entries || []).length) return true;
+  return !!s.authorsTouched || !isDefaultAuthors(s.authors);
 }
 
 /* ---------------- GitHub API ---------------- */
@@ -182,12 +208,18 @@ async function api(path, opts = {}) {
   return { ok: res.ok, status: res.status, json, etag: res.headers.get('ETag') };
 }
 
-async function loadRemote() {
+async function loadRemote(opts = {}) {
   const headers = {};
-  if (remoteEtag) headers['If-None-Match'] = remoteEtag;
+  if (remoteEtag && !opts.fresh) headers['If-None-Match'] = remoteEtag;
   const res = await api(`repos/${cfg.owner}/${cfg.repo}/contents/${DATA_PATH}`, { headers });
   if (res.status === 304) return { unchanged: true };
-  if (res.status === 404) return { missing: true };
+  if (res.status === 404) {
+    // 404 有两种可能：文件确实不存在，或令牌根本看不到这个仓库。
+    // 必须区分开，否则会把"读不到"当成"空的"，进而覆盖线上数据。
+    const repo = await api(`repos/${cfg.owner}/${cfg.repo}`);
+    if (!repo.ok) throw new Error(githubMsg(repo));
+    return { missing: true };
+  }
   if (!res.ok) throw new Error(githubMsg(res));
   remoteEtag = res.etag || remoteEtag;
   remoteSha = res.json.sha;
@@ -206,10 +238,12 @@ function githubMsg(res) {
 
 /* ---------------- 读取 / 写入 ---------------- */
 async function pull(opts = {}) {
-  const got = await loadRemote();
+  const got = await loadRemote(opts);
   if (got.unchanged) return false;
   if (got.missing) {
-    // 远端还没有数据文件：把本地状态推上去作为种子
+    // 远端确实没有数据文件。只有本地真有内容时才创建，
+    // 否则一次误判就会把线上日记覆盖成空的。
+    if (!hasOwnContent()) return false;
     await push('初始化日记本');
     return true;
   }
@@ -228,15 +262,18 @@ async function push(message) {
     for (let attempt = 0; attempt < 4; attempt++) {
       let sha = null;
       try {
-        const got = await loadRemote();
-        if (!got.missing && !got.unchanged) {
+        // 强制绕开 ETag：拿不到最新 sha 就写入，等于盲覆盖对方的日记
+        const got = await loadRemote({ fresh: true });
+        if (got.missing) {
+          if (!hasOwnContent()) return false;
+        } else {
           state = mergeStates(got.state, state);
           sha = got.sha;
-        } else if (!got.missing) {
-          sha = remoteSha;
         }
       } catch (e) {
         if (attempt === 3) throw e;
+        remoteEtag = null;
+        continue;
       }
       pruneTombstones();
       const payload = {
@@ -628,6 +665,7 @@ async function saveNames() {
     b: { name: $('#nameB').value, color: $('#nameBColor').value }
   });
   state.authorsRev = new Date().toISOString();
+  state.authorsTouched = true;
   render();
   try {
     await push('更新作者昵称');
@@ -654,7 +692,7 @@ async function importJson(file) {
   const incoming = Array.isArray(data) ? data : (data.entries || []);
   if (!incoming.length) { showToast('备份里没有日记'); return; }
   const before = (state.entries || []).length;
-  state = mergeStates(state, { entries: incoming, authors: data.authors, authorsRev: '' });
+  state = mergeStates(state, { entries: incoming, authors: data.authors, authorsRev: data.authorsRev || '', authorsTouched: !!data.authorsTouched });
   render();
   try {
     await push(`导入备份（${incoming.length} 篇）`);
@@ -703,10 +741,10 @@ async function connect(owner, repo, token) {
   const repoRes = await api(`repos/${owner}/${repo}`);
   if (!repoRes.ok) throw new Error(githubMsg(repoRes));
 
-  const got = await loadRemote();
+  const got = await loadRemote({ fresh: true });
   if (got.missing) {
+    // 空仓库：不急着创建文件，等第一次真正写下内容时再建
     state = defaultState();
-    await push('初始化日记本');
   } else {
     state = mergeStates(got.state, null);
     remoteSha = got.sha;
