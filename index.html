@@ -5,13 +5,13 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#faf6f0">
 <title>我们的日记</title>
-<link rel="stylesheet" href="style.css?v=3">
+<link rel="stylesheet" href="style.css?v=4">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📖</text></svg>">
 </head>
 <body>
 
 <!-- ============ 首次连接配置 ============ -->
-<div id="setup" class="setup">
+<div id="setup" class="setup hidden">
   <div class="setup-card">
     <div class="setup-logo">📖</div>
     <h1>我们的日记</h1>
@@ -33,6 +33,24 @@
 
     <button id="sConnect" class="btn primary big">连接</button>
     <div id="setupError" class="setup-error hidden"></div>
+  </div>
+</div>
+
+<!-- ============ 密码锁 ============ -->
+<div id="lock" class="setup hidden">
+  <div class="setup-card">
+    <div class="setup-logo">🔒</div>
+    <h1>日记本上锁了</h1>
+    <p class="setup-sub">输入密码才能打开这本日记。</p>
+
+    <div class="field">
+      <label for="lkPass">密码</label>
+      <input id="lkPass" type="password" inputmode="numeric" autocomplete="off" spellcheck="false" placeholder="请输入密码">
+    </div>
+
+    <button id="lkUnlock" class="btn primary big">打开</button>
+    <div id="lockError" class="setup-error hidden"></div>
+    <p class="hint">密码由两个人共用，可在「设置」里修改。万一忘了：到 GitHub 的私有数据仓库里打开 diary.json，删掉 "lock" 那一段，就能重新设置。</p>
   </div>
 </div>
 
@@ -164,6 +182,20 @@
       </div>
 
       <div class="set-group">
+        <div class="set-label">打开密码</div>
+        <div id="lockState" class="conn-info"></div>
+        <div class="field">
+          <label for="lkNew">新密码</label>
+          <input id="lkNew" type="password" inputmode="numeric" autocomplete="new-password" spellcheck="false" placeholder="至少 4 位">
+        </div>
+        <div class="field">
+          <label for="lkNew2">再输一次</label>
+          <input id="lkNew2" type="password" inputmode="numeric" autocomplete="new-password" spellcheck="false" placeholder="确认新密码">
+        </div>
+        <button id="saveLock" class="btn">保存密码（两台设备同时生效）</button>
+      </div>
+
+      <div class="set-group">
         <div class="set-label">统计</div>
         <div id="statsBox" class="stats"></div>
       </div>
@@ -180,6 +212,6 @@
 <div id="connBanner" class="conn-banner hidden"></div>
 <div id="toast" class="toast hidden"></div>
 
-<script src="app.js?v=3"></script>
+<script src="app.js?v=4"></script>
 </body>
 </html>
