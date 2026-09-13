@@ -384,8 +384,9 @@ async function pull(opts = {}) {
   remoteSha = got.sha;
   const merged = mergeStates(got.state, state);
   const changed = JSON.stringify(merged) !== JSON.stringify(state);
-  state = merged;
-  saveCache();
+  // 内容没变时不要替换 state：mergeStates 造的是全新对象，而 silentSync 只在 changed
+  // 时才重绘，换了对象就等于让页面上每张卡片都持有失效引用。
+  if (changed) { state = merged; saveCache(); }
   return changed;
 }
 
@@ -675,14 +676,18 @@ function fmtStamp(iso) {
 }
 
 async function addComment(e, paraIdx, text) {
-  e.comments = e.comments || [];
-  e.comments.push(normComment({ id: newId(), para: paraIdx, author: me, text, createdAt: new Date().toISOString() }));
-  e.comments = mergeComments(e.comments, []);
-  e.updatedAt = new Date().toISOString();
+  // 卡片闭包里的 e 可能已经被一次同步换成了新对象，必须按 id 取回 state 里的那一条，
+  // 否则留言写进了游离对象，push 上去的数据里根本没有它。
+  const target = (state.entries || []).find(x => x.id === e.id);
+  if (!target) { showToast('这篇日记刚刚被改动了，请再试一次'); render(); return; }
+  target.comments = mergeComments(target.comments, [normComment({
+    id: newId(), para: paraIdx, author: me, text, createdAt: new Date().toISOString()
+  })]);
+  target.updatedAt = new Date().toISOString();
   state.entries = sortEntries(state.entries);
   render();
   try {
-    await push(`留言于 ${e.date} 的日记`);
+    await push(`留言于 ${target.date} 的日记`);
     showToast('留言已发送');
     render();
   } catch (err) {
