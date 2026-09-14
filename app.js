@@ -446,7 +446,7 @@ async function getMediaBuf(item, variant) {
   const key = sha || ('p:media/' + item.id + suffix + '.jpg');
 
   const cached = await idbGet(key);
-  if (cached) return getObjectUrl(key, cached.buf, cached.mime || mime);
+  if (cached) return cached.buf;
 
   await semAcquire();
   try {
@@ -460,7 +460,7 @@ async function getMediaBuf(item, variant) {
     if (!res.ok) throw new Error('媒体读取失败：' + res.status);
     const raw = await res.arrayBuffer();
     await idbPut(key, raw, mime, raw.byteLength);
-    return getObjectUrl(key, raw, mime);
+    return raw;
   } finally {
     semRelease();
   }
