@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#faf6f0">
 <title>我们的日记</title>
-<link rel="stylesheet" href="style.css?v=5">
+<link rel="stylesheet" href="style.css?v=6">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📖</text></svg>">
 </head>
 <body>
@@ -63,6 +63,13 @@
       <span class="brand-text">我们的日记</span>
     </div>
     <div class="topbar-actions">
+      <button id="albumBtn" class="icon-btn" title="相册" aria-label="相册">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+      </button>
+      <button id="notifBtn" class="icon-btn" title="更新提醒" aria-label="更新提醒">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+        <span id="notifDot" class="dot hidden"></span>
+      </button>
       <button id="syncBtn" class="icon-btn" title="立即同步" aria-label="立即同步">
         <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>
       </button>
@@ -92,6 +99,14 @@
       <button id="todayBtn" class="chip-btn">回到今天</button>
       <button id="allBtn" class="chip-btn">看全部</button>
     </div>
+  </section>
+
+  <section id="albumWindow" class="card album-window hidden">
+    <div class="album-win-head">
+      <span class="album-win-title">最近照片</span>
+      <button id="albumWinAll" class="chip-btn">查看全部 ›</button>
+    </div>
+    <div id="albumWinGrid" class="album-win-grid"></div>
   </section>
 
   <section class="entries">
@@ -130,6 +145,18 @@
       <div class="field grow">
         <label for="fContent">正文</label>
         <textarea id="fContent" placeholder="今天发生了什么…"></textarea>
+      </div>
+      <div class="field">
+        <label>照片 <span class="opt">（可选）</span></label>
+        <div id="composeMediaBar" class="media-bar">
+          <label class="btn import-label media-add-btn">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+            添加照片
+            <input id="fMedia" type="file" accept="image/*" multiple hidden>
+          </label>
+          <div id="composePending" class="pending-media"></div>
+        </div>
+        <div id="composeUploadStatus" class="upload-status hidden"></div>
       </div>
       <div class="field">
         <label>以谁的身份</label>
@@ -209,9 +236,52 @@
   </div>
 </div>
 
+<!-- ============ 更新提醒面板 ============ -->
+<div id="notifSheet" class="sheet hidden" role="dialog" aria-modal="true">
+  <div class="sheet-panel">
+    <div class="sheet-head">
+      <span></span>
+      <div class="sheet-title">更新提醒</div>
+      <button id="closeNotif" class="sheet-btn">关闭</button>
+    </div>
+    <div id="notifList" class="sheet-body notif-list"></div>
+  </div>
+</div>
+
+<!-- ============ 相册视图 ============ -->
+<div id="albumView" class="album-view hidden">
+  <div class="album-top">
+    <div class="album-top-left">
+      <span class="album-top-title">相册</span>
+      <div id="albumFilters" class="album-filters">
+        <button class="chip-btn active" data-filter="all">全部</button>
+        <button class="chip-btn" data-filter="a">—</button>
+        <button class="chip-btn" data-filter="b">—</button>
+      </div>
+    </div>
+    <button id="closeAlbum" class="icon-btn" title="关闭相册" aria-label="关闭相册">✕</button>
+  </div>
+  <div id="albumGrid" class="album-grid"></div>
+</div>
+
+<!-- ============ 照片查看器 ============ -->
+<div id="photoViewer" class="photo-viewer hidden">
+  <div class="pv-top">
+    <div id="pvInfo" class="pv-info"></div>
+    <button id="pvDelete" class="icon-btn pv-act" title="删除照片">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
+    </button>
+    <button id="closeViewer" class="icon-btn pv-act" title="关闭">✕</button>
+  </div>
+  <div id="pvBody" class="pv-body">
+    <img id="pvImg" alt="">
+  </div>
+  <div id="pvCaption" class="pv-caption"></div>
+</div>
+
 <div id="connBanner" class="conn-banner hidden"></div>
 <div id="toast" class="toast hidden"></div>
 
-<script src="app.js?v=5"></script>
+<script src="app.js?v=6"></script>
 </body>
 </html>
