@@ -8,6 +8,7 @@ const LS_CFG   = 'ourdiary.cfg';      // { owner, repo, token }
 const LS_ME    = 'ourdiary.me';       // 'a' | 'b'
 const LS_CACHE = 'ourdiary.cache';    // 最近一次已知状态，用于秒开
 const SS_UNLOCK = 'ourdiary.unlock';  // 本次会话已解锁的密码指纹（sessionStorage：关掉重开就要重输）
+const LS_SEEN  = 'ourdiary.seen';    // 上次已读到的时间戳（ISO），用于更新提醒
 
 const DATA_PATH = 'diary.json';
 const POLL_MS   = 30000;
@@ -25,7 +26,70 @@ let selectedDate = todayKey();
 let calYear, calMonth;     // 日历当前显示的年月
 let editingId = null;
 let composeAuthor = me;
+let pendingMedia = [];
 let pollTimer = null;
+let mediaIO = null;        // 照片懒加载用的单个 IntersectionObserver
+let seenSeededThisBoot = false;
+
+/* ---------------- 更新提醒 ---------------- */
+// 首次启动时把"已读位置"设成当前时间，这样现存的日记和留言不会全部变成未读。
+// 只在键不存在时播种；同一次启动内只播一次，connect 成功后也补播一次。
+function seedSeen() {
+  if (!localStorage.getItem(LS_SEEN)) {
+    localStorage.setItem(LS_SEEN, new Date().toISOString());
+    seenSeededThisBoot = true;
+  }
+}
+function seenStamp() {
+  try { return localStorage.getItem(LS_SEEN) || ''; } catch (e) { return ''; }
+}
+function bumpSeen() {
+  try { localStorage.setItem(LS_SEEN, new Date().toISOString()); } catch (e) { /* ignore */ }
+  paintBadge(0);
+}
+function paintBadge(n) {
+  const dot = $('#notifDot');
+  if (!dot) return;
+  if (n > 0) { dot.textContent = n > 99 ? '99+' : String(n); dot.classList.remove('hidden'); }
+  else { dot.classList.add('hidden'); }
+}
+// 收集 since 之后的对方事件：新日记、新留言、新照片。
+// 折叠规则：若某篇日记本身已触发 'entry' 事件，它下面的照片事件就并进后缀（"含 N 张照片"），
+// 否则一篇带 3 张图的新日记会炸出 4 条提醒。
+function collectEvents(since) {
+  if (!since || !state) return [];
+  const events = [];
+  for (const e of liveEntries()) {
+    if (e.createdAt <= since || e.author === me) continue;
+    events.push({ kind: 'entry', entryId: e.id, date: e.date, author: e.author, createdAt: e.createdAt, title: e.title, photoCount: 0 });
+  }
+  for (const e of liveEntries()) {
+    for (const c of (e.comments || [])) {
+      if (c.deleted || c.createdAt <= since || c.author === me) continue;
+      events.push({ kind: 'comment', entryId: e.id, date: e.date, author: c.author, createdAt: c.createdAt, text: c.text, para: c.para });
+    }
+    const liveMedia = (e.media || []).filter(m => !m.deleted);
+    for (const m of liveMedia) {
+      if (m.createdAt <= since || m.author === me) continue;
+      events.push({ kind: 'photo', entryId: e.id, date: e.date, author: m.author, createdAt: m.createdAt });
+    }
+  }
+  // 折叠：把照片事件并到同一篇日记的 entry 事件里
+  const entryIds = new Set(events.filter(ev => ev.kind === 'entry').map(ev => ev.entryId));
+  const folded = events.filter(ev => {
+    if (ev.kind !== 'photo') return true;
+    if (entryIds.has(ev.entryId)) return false;
+    return true;
+  });
+  // 给 entry 事件附上照片计数
+  for (const ev of folded) {
+    if (ev.kind === 'entry') {
+      ev.photoCount = events.filter(p => p.kind === 'photo' && p.entryId === ev.entryId).length;
+    }
+  }
+  folded.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  return folded.slice(0, 50);
+}
 
 /* ---------------- 日期工具 ---------------- */
 function pad(n) { return String(n).padStart(2, '0'); }
@@ -71,6 +135,335 @@ function b64decodeUtf8(b64) {
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
   return new TextDecoder().decode(bytes);
+}
+
+/* ---------------- 二进制与媒体 ---------------- */
+function bufToB64(buf) {
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  const CH = 0x8000;
+  for (let i = 0; i < bytes.length; i += CH) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
+  }
+  return btoa(bin);
+}
+function b64ToBuf(b64) {
+  const bin = atob(b64.replace(/\s+/g, ''));
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes.buffer;
+}
+function blobToBuf(blob) {
+  return new Promise(function (resolve, reject) {
+    const r = new FileReader();
+    r.onload = function () { resolve(r.result); };
+    r.onerror = function () { reject(r.error || new Error('FileReader 失败')); };
+    r.readAsArrayBuffer(blob);
+  });
+}
+function canvasToBlob(canvas, type, quality) {
+  return new Promise(function (resolve, reject) {
+    canvas.toBlob(function (b) {
+      if (b) resolve(b); else reject(new Error('toBlob 返回空'));
+    }, type, quality);
+  });
+}
+function fmtBytes(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1048576).toFixed(1) + ' MB';
+}
+
+function decodeImage(file) {
+  if (typeof createImageBitmap === 'function') {
+    return createImageBitmap(file).then(function (bmp) {
+      return { bmp: bmp, w: bmp.width, h: bmp.height };
+    });
+  }
+  return new Promise(function (resolve, reject) {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = function () {
+      resolve({ bmp: img, w: img.naturalWidth, h: img.naturalHeight, revoke: function () { URL.revokeObjectURL(url); } });
+    };
+    img.onerror = function () { URL.revokeObjectURL(url); reject(new Error('图片解码失败')); };
+    if (img.decode) { img.src = url; img.decode().catch(function () {}); }
+    else { img.src = url; }
+  });
+}
+
+async function compressPhoto(file, longEdge, quality) {
+  const dec = await decodeImage(file);
+  const bmp = dec.bmp;
+  const w = dec.w, h = dec.h;
+  const s = Math.min(1, longEdge / Math.max(w, h));
+  const tw = Math.round(w * s), th = Math.round(h * s);
+  const cvs = document.createElement('canvas');
+  cvs.width = tw; cvs.height = th;
+  const ctx = cvs.getContext('2d');
+  ctx.imageSmoothingQuality = 'high';
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, tw, th);
+  ctx.drawImage(bmp, 0, 0, tw, th);
+  if (dec.revoke) dec.revoke();
+  if (typeof bmp.close === 'function') bmp.close();
+  return { canvas: cvs, w: tw, h: th, origW: w, origH: h };
+}
+
+async function compressToBlob(file, longEdge, quality) {
+  const r = await compressPhoto(file, longEdge, quality);
+  let blob = await canvasToBlob(r.canvas, 'image/jpeg', quality);
+  if (blob.size > 2560000) {
+    for (const q of [0.8, 0.7, 0.6]) {
+      blob = await canvasToBlob(r.canvas, 'image/jpeg', q);
+      if (blob.size <= 2560000) break;
+    }
+  }
+  if (blob.size > 2560000) {
+    for (const le of [2048, 1600]) {
+      const r2 = await compressPhoto(file, le, 0.7);
+      blob = await canvasToBlob(r2.canvas, 'image/jpeg', 0.7);
+      if (blob.size <= 2560000) { r.w = r2.w; r.h = r2.h; r.origW = r2.origW; r.origH = r2.origH; break; }
+    }
+  }
+  return { blob: blob, w: r.origW, h: r.origH };
+}
+
+async function compressThumb(file) {
+  const r = await compressPhoto(file, 320, 0.72);
+  const blob = await canvasToBlob(r.canvas, 'image/jpeg', 0.72);
+  return { blob: blob, w: r.w, h: r.h };
+}
+
+async function putMediaOne(file) {
+  const id = newId();
+  const isGif = file.type === 'image/gif';
+  let fullBlob, fullW, fullH, thumbBlob;
+
+  if (isGif) {
+    if (file.size > 4194304) throw new Error('GIF 文件超过 4MB，请压缩后再上传');
+    fullBlob = file;
+    fullW = 0; fullH = 0;
+    try {
+      const th = await compressThumb(file);
+      thumbBlob = th.blob;
+    } catch (e) {
+      thumbBlob = file;
+    }
+  } else {
+    if (file.size > 12582912) throw new Error('「' + file.name + '」超过 12MB，请先压缩');
+    try {
+      const full = await compressToBlob(file, 2560, 0.9);
+      fullBlob = full.blob; fullW = full.w; fullH = full.h;
+    } catch (e) {
+      const msg = '「' + (file.name || '图片') + '」读不出来';
+      if (/heic/i.test(file.name) || /heic/i.test(file.type)) {
+        throw new Error(msg + '（可能是 HEIC 格式）。请到 iPhone「设置 › 相机 › 格式」改为「兼容性优先」，或先转成 JPG。');
+      }
+      throw new Error(msg + '（格式不支持）');
+    }
+    try {
+      const th = await compressThumb(file);
+      thumbBlob = th.blob;
+    } catch (e) {
+      thumbBlob = fullBlob;
+    }
+  }
+
+  const thumbBuf = await blobToBuf(thumbBlob);
+  const fullBuf = await blobToBuf(fullBlob);
+  const thumbB64 = bufToB64(thumbBuf);
+  const fullB64 = bufToB64(fullBuf);
+
+  const tPath = 'media/' + id + '_t.jpg';
+  const fPath = 'media/' + id + '.jpg';
+
+  const tRes = await api('repos/' + cfg.owner + '/' + cfg.repo + '/contents/' + tPath, {
+    method: 'PUT',
+    body: JSON.stringify({ message: '添加缩略图 ' + id, content: thumbB64 })
+  });
+  if (!tRes.ok) throw new Error('上传缩略图失败：' + githubMsg(tRes));
+  const thumbSha = tRes.json && tRes.json.content ? tRes.json.content.sha : '';
+
+  const fRes = await api('repos/' + cfg.owner + '/' + cfg.repo + '/contents/' + fPath, {
+    method: 'PUT',
+    body: JSON.stringify({ message: '添加照片 ' + id, content: fullB64 })
+  });
+  if (!fRes.ok) throw new Error('上传照片失败：' + githubMsg(fRes));
+  const fullSha = fRes.json && fRes.json.content ? fRes.json.content.sha : '';
+
+  const mime = isGif ? 'gif' : 'jpeg';
+  return normMedia({
+    id: id,
+    kind: 'photo',
+    thumbSha: thumbSha,
+    fullSha: fullSha,
+    mime: mime,
+    bytes: fullBlob.size,
+    thumbBytes: thumbBlob.size,
+    w: fullW,
+    h: fullH,
+    author: me,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  });
+}
+
+async function putMediaFiles(fileList) {
+  const files = Array.from(fileList);
+  const results = [];
+  const errors = [];
+  for (const f of files) {
+    try {
+      const m = await putMediaOne(f);
+      results.push(m);
+    } catch (e) {
+      errors.push(e.message);
+    }
+  }
+  return { items: results, errors: errors };
+}
+
+/* ---------------- IndexedDB 媒体缓存 ---------------- */
+const IDB_NAME = 'ourdiary-media';
+const IDB_STORE = 'blobs';
+const IDB_MAX_ENTRIES = 400;
+const IDB_MAX_BYTES = 150 * 1024 * 1024;
+const URL_MAX = 60;
+
+let idb = null;
+let idbDisabled = false;
+const idbL1 = new Map();
+const urlCache = new Map();
+
+function openIdb() {
+  if (idbDisabled) return Promise.resolve(null);
+  if (idb) return Promise.resolve(idb);
+  return new Promise(function (resolve) {
+    try {
+      const req = indexedDB.open(IDB_NAME, 1);
+      req.onupgradeneeded = function () {
+        if (!req.result.objectStoreNames.contains(IDB_STORE)) {
+          req.result.createObjectStore(IDB_STORE, { keyPath: 'key' });
+        }
+      };
+      req.onsuccess = function () { idb = req.result; resolve(idb); };
+      req.onerror = function () { idbDisabled = true; resolve(null); };
+    } catch (e) { idbDisabled = true; resolve(null); }
+  });
+}
+
+function idbPut(key, buf, mime, bytes) {
+  return openIdb().then(function (db) {
+    if (!db) return;
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    tx.objectStore(IDB_STORE).put({ key: key, buf: buf, mime: mime, bytes: bytes, at: Date.now() });
+    idbL1.set(key, { buf: buf, mime: mime, bytes: bytes });
+    return new Promise(function (resolve) {
+      tx.oncomplete = function () { idbEvict().then(resolve, resolve); };
+      tx.onerror = function () { resolve(); };
+    });
+  });
+}
+
+function idbGet(key) {
+  const hit = idbL1.get(key);
+  if (hit) return Promise.resolve(hit);
+  return openIdb().then(function (db) {
+    if (!db) return null;
+    return new Promise(function (resolve) {
+      const tx = db.transaction(IDB_STORE, 'readonly');
+      const req = tx.objectStore(IDB_STORE).get(key);
+      req.onsuccess = function () {
+        const r = req.result;
+        if (r) { idbL1.set(key, { buf: r.buf, mime: r.mime, bytes: r.bytes }); resolve({ buf: r.buf, mime: r.mime, bytes: r.bytes }); }
+        else resolve(null);
+      };
+      req.onerror = function () { resolve(null); };
+    });
+  });
+}
+
+function idbEvict() {
+  return openIdb().then(function (db) {
+    if (!db) return;
+    return new Promise(function (resolve) {
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      const store = tx.objectStore(IDB_STORE);
+      const all = [];
+      store.openCursor().onsuccess = function (ev) {
+        const cursor = ev.target.result;
+        if (cursor) { all.push(cursor.value); cursor.continue(); }
+        else {
+          all.sort(function (a, b) { return a.at - b.at; });
+          let totalBytes = all.reduce(function (s, r) { return s + (r.bytes || 0); }, 0);
+          let toDelete = [];
+          while (all.length > IDB_MAX_ENTRIES || totalBytes > IDB_MAX_BYTES) {
+            const old = all.shift();
+            toDelete.push(old.key);
+            totalBytes -= (old.bytes || 0);
+            idbL1.delete(old.key);
+          }
+          for (const k of toDelete) store.delete(k);
+        }
+      };
+      tx.oncomplete = resolve;
+      tx.onerror = resolve;
+    });
+  });
+}
+
+function getObjectUrl(key, buf, mime) {
+  if (urlCache.has(key)) return urlCache.get(key);
+  const url = URL.createObjectURL(new Blob([buf], { type: 'image/' + mime }));
+  urlCache.set(key, url);
+  if (urlCache.size > URL_MAX) {
+    const oldest = urlCache.keys().next().value;
+    URL.revokeObjectURL(urlCache.get(oldest));
+    urlCache.delete(oldest);
+  }
+  return url;
+}
+
+const SEMAPHORE_MAX = 3;
+let semActive = 0;
+const semQueue = [];
+function semAcquire() {
+  return new Promise(function (resolve) {
+    if (semActive < SEMAPHORE_MAX) { semActive++; resolve(); }
+    else semQueue.push(resolve);
+  });
+}
+function semRelease() {
+  if (semQueue.length) { const next = semQueue.shift(); next(); }
+  else semActive--;
+}
+
+async function getMediaBuf(item, variant) {
+  const sha = variant === 't' ? item.thumbSha : item.fullSha;
+  const mime = item.mime || 'jpeg';
+  const suffix = variant === 't' ? '_t' : '';
+  const key = sha || ('p:media/' + item.id + suffix + '.jpg');
+
+  const cached = await idbGet(key);
+  if (cached) return getObjectUrl(key, cached.buf, cached.mime || mime);
+
+  await semAcquire();
+  try {
+    if (!cfg || !sha) throw new Error('未连接或缺少 sha');
+    const res = await fetch('https://api.github.com/repos/' + cfg.owner + '/' + cfg.repo + '/git/blobs/' + sha, {
+      headers: {
+        'Authorization': 'Bearer ' + cfg.token,
+        'Accept': 'application/vnd.github.raw'
+      }
+    });
+    if (!res.ok) throw new Error('媒体读取失败：' + res.status);
+    const raw = await res.arrayBuffer();
+    await idbPut(key, raw, mime, raw.byteLength);
+    return getObjectUrl(key, raw, mime);
+  } finally {
+    semRelease();
+  }
 }
 
 /* ---------------- 状态与合并 ---------------- */
@@ -126,26 +519,83 @@ function normEntry(e) {
     updatedAt: String(e.updatedAt || e.createdAt || new Date().toISOString()),
     edited: !!e.edited,
     deleted: !!e.deleted,
+    media: Array.isArray(e.media) ? e.media.map(normMedia).filter(Boolean) : [],
     comments: Array.isArray(e.comments) ? e.comments.map(normComment) : []
   };
 }
 function normComment(c) {
+  c = c || {};
+  const para = Math.max(0, parseInt(c.para, 10) || 0);
+  const author = c.author === 'b' ? 'b' : 'a';
+  const text = String(c.text || '').slice(0, 500);
+  const createdAt = String(c.createdAt || new Date().toISOString());
   return {
-    id: String(c.id || newId()),
-    para: Math.max(0, parseInt(c.para, 10) || 0),
-    author: c.author === 'b' ? 'b' : 'a',
-    text: String(c.text || '').slice(0, 500),
-    createdAt: String(c.createdAt || new Date().toISOString())
+    id: String(c.id || stableCommentId({ para: para, author: author, createdAt: c.createdAt, text: c.text })),
+    para: para,
+    author: author,
+    text: text,
+    createdAt: createdAt,
+    updatedAt: String(c.updatedAt || ''),
+    edited: !!c.edited,
+    deleted: !!c.deleted,
+    deletedAt: String(c.deletedAt || ''),
+    media: Array.isArray(c.media) ? c.media.map(normMedia).filter(Boolean) : []
   };
 }
-function mergeComments(x, y) {
-  const m = new Map();
-  for (const c of [...(x || []), ...(y || [])]) {
-    const n = normComment(c);
-    if (!m.has(n.id)) m.set(n.id, n);
+function fnv1a(str, seed) {
+  let h = seed >>> 0;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
   }
-  return [...m.values()].sort((p, q) => (p.createdAt || '').localeCompare(q.createdAt || ''));
+  return h.toString(16).padStart(8, '0');
 }
+// 没有 id 的留言（旧数据）只能用"确定性"的 id：随机 id 会让同一条留言每次 merge 都复制一份。
+// 只吃原始字段，绝不吃兜底的 now() —— 两台设备时间不同，兜底值参与计算就失去确定性了。
+function stableCommentId(c) {
+  const key = [c.para, c.author, c.createdAt || '', c.text || ''].join('|');
+  return 'c' + fnv1a(key, 0x811c9dc5) + fnv1a(key, 0x9e3779b1);
+}
+const MEDIA_MIMES = ['jpeg', 'png', 'webp', 'gif'];
+function normMedia(m) {
+  m = m || {};
+  const id = String(m.id || '');
+  if (!id) return null;
+  const sha = (v) => (/^[0-9a-f]{40}$/.test(String(v || '')) ? String(v) : '');
+  return {
+    id: id,
+    kind: 'photo',
+    thumbSha: sha(m.thumbSha),
+    fullSha: sha(m.fullSha),
+    mime: MEDIA_MIMES.indexOf(m.mime) >= 0 ? m.mime : 'jpeg',
+    bytes: Math.max(0, parseInt(m.bytes, 10) || 0),
+    thumbBytes: Math.max(0, parseInt(m.thumbBytes, 10) || 0),
+    w: Math.max(0, parseInt(m.w, 10) || 0),
+    h: Math.max(0, parseInt(m.h, 10) || 0),
+    author: m.author === 'b' ? 'b' : 'a',
+    createdAt: String(m.createdAt || ''),
+    updatedAt: String(m.updatedAt || ''),
+    deleted: !!m.deleted,
+    deletedAt: String(m.deletedAt || '')
+  };
+}
+// 留言和照片都按"最后写入者胜"合并：谁的时间新谁说了算。
+// 编辑和删除都会刷新 updatedAt，所以墓碑能像日记那样赢得竞争，不需要特例。
+// >= 让平局归后遍历的那一侧（本地），乐观渲染出来的内容才不会被自己这次合并换掉。
+function lwwMerge(x, y, norm, score) {
+  const m = new Map();
+  for (const raw of [...(x || []), ...(y || [])]) {
+    const n = norm(raw);
+    if (!n) continue;
+    const prev = m.get(n.id);
+    if (!prev || score(n) >= score(prev)) m.set(n.id, n);
+  }
+  return [...m.values()].sort((p, q) =>
+    (p.createdAt || '').localeCompare(q.createdAt || '') || p.id.localeCompare(q.id));
+}
+const byStamp = (o) => String(o.updatedAt || o.createdAt || '');
+function mergeComments(x, y) { return lwwMerge(x, y, normComment, byStamp); }
+function mergeMedia(x, y) { return lwwMerge(x, y, normMedia, byStamp); }
 function sortEntries(list) {
   return list.slice().sort((p, q) =>
     (q.date || '').localeCompare(p.date || '') ||
@@ -158,8 +608,11 @@ function mergeStates(x, y) {
     if (!e.id) continue;
     const prev = byId.get(e.id);
     if (!prev) { byId.set(e.id, e); continue; }
+    // body 整体二选一，所以 comments 和 media 必须各自再合并一次：
+    // 否则"一方加照片、另一方之后改文字"时，照片会跟着落败的 body 一起消失。
     const base = (e.updatedAt || '') > (prev.updatedAt || '') ? e : prev;
     base.comments = mergeComments(prev.comments, e.comments);
+    base.media = mergeMedia(prev.media, e.media);
     byId.set(e.id, base);
   }
   const win = pickAuthorsSide(x, y);
@@ -179,11 +632,15 @@ function liveEntries() {
 }
 function pruneTombstones() {
   const cutoff = Date.now() - 30 * 24 * 3600 * 1000;
-  state.entries = (state.entries || []).filter(e => {
-    if (!e.deleted) return true;
-    const t = Date.parse(e.updatedAt);
-    return isNaN(t) || t > cutoff;
-  });
+  // 时间戳解析不出来就留着：宁可占点空间，也不能把还能救的数据扔掉。
+  const expired = (iso) => { const t = Date.parse(iso); return !isNaN(t) && t <= cutoff; };
+  const pruneList = (list) => (list || []).filter(o => !(o.deleted && expired(o.deletedAt || o.updatedAt)));
+  state.entries = pruneList(state.entries);
+  for (const e of state.entries) {
+    e.media = pruneList(e.media);
+    e.comments = pruneList(e.comments);
+    for (const c of e.comments) c.media = pruneList(c.media);
+  }
 }
 // 本地是否真有内容（日记，或改过的作者名/颜色）。
 // 只有为 true 时才允许在远端没有数据文件的情况下创建它。
@@ -263,6 +720,12 @@ async function enterApp() {
     await pull();
     hideConnBanner();
     render();
+    // 解锁后刷一次红点，但不弹 toast、不推进 seen——每次开页面都弹是噪音
+    const since = seenStamp();
+    if (since) {
+      const events = collectEvents(since);
+      paintBadge(events.length);
+    }
   } catch (e) {
     showConnBanner('同步失败：' + e.message + '（显示的是本机缓存）');
   }
@@ -357,6 +820,11 @@ async function loadRemote(opts = {}) {
   if (!res.ok) throw new Error(githubMsg(res));
   remoteEtag = res.etag || remoteEtag;
   remoteSha = res.json.sha;
+  // >1MB 的文件 GitHub 返回 encoding:"none" 且 content 为空，JSON.parse('') 会抛错，
+  // 必须在这里拦住，否则同步全废且报错信息是天书。
+  if (res.json.encoding === 'none' || !res.json.content) {
+    throw new Error('数据文件已超过 GitHub 单文件读取上限，无法继续同步。请清理旧内容后重试。');
+  }
   const parsed = JSON.parse(b64decodeUtf8(res.json.content));
   return { state: parsed, sha: res.json.sha };
 }
@@ -411,9 +879,16 @@ async function push(message) {
         continue;
       }
       pruneTombstones();
+      const jsonStr = JSON.stringify(state, null, 2);
+      // 850KB 闸门：base64 膨胀 33% 后约 1.13MB，超过 GitHub 1MB 限制就读不回来了。
+      // 必须在这里拦住，绝不能写出一个下次读不回来的文件。
+      if (jsonStr.length > 850000) {
+        showConnBanner('数据文件已接近 GitHub 单文件上限（' + Math.round(jsonStr.length / 1024) + 'KB），请先清理旧内容再写入。');
+        throw new Error('数据文件过大，拒绝写入');
+      }
       const payload = {
         message,
-        content: b64encodeUtf8(JSON.stringify(state, null, 2))
+        content: b64encodeUtf8(jsonStr)
       };
       if (sha) payload.sha = sha;
       const res = await api(`repos/${cfg.owner}/${cfg.repo}/contents/${DATA_PATH}`, {
@@ -460,22 +935,85 @@ function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = 
 
 async function silentSync() {
   if (pushing || !cfg) return;
+  const since = seenStamp();
   try {
-    const before = new Set(liveEntries().map(e => e.id));
     const changed = await pull();
     hideConnBanner();
     if (changed) {
-      const added = liveEntries().filter(e => !before.has(e.id));
       render();
-      const other = added.filter(e => e.author !== me);
-      if (other.length) {
-        const who = state.authors[other[0].author].name;
-        showToast(`「${who}」写了 ${other.length} 篇新日记`);
+      // 首次播种的这次启动不计算事件、不亮红点——否则现存内容全变成未读
+      if (since && !seenSeededThisBoot) {
+        const events = collectEvents(since);
+        paintBadge(events.length);
+        if (events.length) {
+          const first = events[0];
+          const who = state.authors[first.author].name;
+          const labels = { entry: '写了新日记', comment: '留了言', photo: '发了照片' };
+          showToast(`「${who}」${labels[first.kind] || '更新了'}`);
+        }
       }
     }
   } catch (e) {
     showConnBanner('同步失败：' + e.message);
   }
+}
+
+/* ---------------- 跳转到某篇日记 ---------------- */
+function gotoEntry(entryId) {
+  const e = liveEntry(entryId);
+  if (!e) return;
+  const d = fromKey(e.date);
+  calYear = d.getFullYear();
+  calMonth = d.getMonth();
+  selectedDate = e.date;
+  viewMode = 'day';
+  render();
+  // 等 DOM 重建完再滚动和高亮
+  requestAnimationFrame(() => {
+    const card = document.querySelector(`.entry[data-id="${entryId}"]`);
+    if (!card) return;
+    card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    card.classList.add('flash');
+    setTimeout(() => card.classList.remove('flash'), 1200);
+  });
+}
+
+/* ---------------- 更新提醒面板 ---------------- */
+function openNotifSheet() {
+  const since = seenStamp();
+  const events = since ? collectEvents(since) : [];
+  const list = $('#notifList');
+  list.innerHTML = '';
+  for (const ev of events) {
+    const who = state.authors[ev.author].name;
+    const au = state.authors[ev.author];
+    let icon = '📝', text = '';
+    if (ev.kind === 'entry') {
+      icon = '📖';
+      text = `「${who}」写了新日记${ev.title ? `《${ev.title}》` : ''}${ev.photoCount ? `（含 ${ev.photoCount} 张照片）` : ''}`;
+    } else if (ev.kind === 'comment') {
+      icon = '💬';
+      const brief = ev.text.length > 30 ? ev.text.slice(0, 30) + '…' : ev.text;
+      text = `「${who}」留言：${brief}`;
+    } else if (ev.kind === 'photo') {
+      icon = '📷';
+      text = `「${who}」发了照片`;
+    }
+    const item = document.createElement('div');
+    item.className = 'notif-item';
+    item.innerHTML = `<div class="notif-icon" style="background:${esc(au.color)}20;color:${esc(au.color)}">${icon}</div>
+      <div class="notif-body">
+        <div class="notif-text">${esc(text)}</div>
+        <div class="notif-time">${esc(fmtStamp(ev.createdAt))}</div>
+      </div>`;
+    item.addEventListener('click', () => {
+      bumpSeen();
+      $('#notifSheet').classList.add('hidden');
+      gotoEntry(ev.entryId);
+    });
+    list.appendChild(item);
+  }
+  $('#notifSheet').classList.remove('hidden');
 }
 
 /* ---------------- 渲染 ---------------- */
@@ -485,12 +1023,236 @@ function esc(s) {
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
+/* ---------------- 照片懒加载 ---------------- */
+function setupMediaObserver() {
+  if (mediaIO) mediaIO.disconnect();
+  mediaIO = new IntersectionObserver((entries) => {
+    for (const io of entries) {
+      if (!io.isIntersecting) continue;
+      const el = io.target;
+      mediaIO.unobserve(el);
+      loadMediaThumb(el);
+    }
+  }, { rootMargin: '300px' });
+
+  document.querySelectorAll('.media-placeholder[data-media-id]').forEach(el => mediaIO.observe(el));
+}
+
+async function loadMediaThumb(el) {
+  const mid = el.dataset.mediaId;
+  const item = findMediaItem(mid);
+  if (!item) return;
+  try {
+    const buf = await getMediaBuf(item.m, 't');
+    const url = getObjectUrl(mid + ':t', buf, item.m.mime);
+    el.classList.remove('media-placeholder');
+    const img = document.createElement('img');
+    img.src = url;
+    img.alt = '';
+    img.loading = 'lazy';
+    if (item.m.w && item.m.h) {
+      const ratio = item.m.h / item.m.w;
+      img.style.aspectRatio = `1 / ${Math.min(ratio, 1.5)}`;
+    }
+    el.appendChild(img);
+    el.dataset.loaded = '1';
+  } catch (e) {
+    el.textContent = '…';
+  }
+}
+
+function findMediaItem(mid) {
+  for (const e of liveEntries()) {
+    for (const m of (e.media || [])) {
+      if (m.id === mid && !m.deleted) return { m, entryId: e.id, date: e.date, author: m.author || e.author };
+    }
+    for (const c of (e.comments || [])) {
+      if (c.deleted) continue;
+      for (const m of (c.media || [])) {
+        if (m.id === mid && !m.deleted) return { m, entryId: e.id, commentId: c.id, date: c.createdAt, author: m.author || c.author };
+      }
+    }
+  }
+  return null;
+}
+
+/* ---------------- 相册（派生视图） ---------------- */
+let albumFilter = 'all';
+
+function albumItems() {
+  const items = [];
+  for (const e of liveEntries()) {
+    for (const m of (e.media || [])) {
+      if (m.deleted) continue;
+      items.push({ m, entryId: e.id, date: e.date, author: m.author || e.author, source: 'entry', title: e.title });
+    }
+    for (const c of (e.comments || [])) {
+      if (c.deleted) continue;
+      for (const m of (c.media || [])) {
+        if (m.deleted) continue;
+        items.push({ m, entryId: e.id, commentId: c.id, date: c.createdAt || e.date, author: m.author || c.author, source: 'comment' });
+      }
+    }
+  }
+  items.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+  return items;
+}
+
+function renderAlbumWindow() {
+  const win = $('#albumWindow');
+  const grid = $('#albumWinGrid');
+  const all = albumItems();
+  if (!all.length) { win.classList.add('hidden'); return; }
+  win.classList.remove('hidden');
+  grid.innerHTML = '';
+  const recent = all.slice(0, 6);
+  for (let i = 0; i < recent.length; i++) {
+    const it = recent[i];
+    const div = document.createElement('div');
+    div.className = 'aw-thumb media-placeholder';
+    div.dataset.mediaId = it.m.id;
+    div.dataset.albumIdx = String(i);
+    div.addEventListener('click', () => openAlbumViewer(recent, i));
+    grid.appendChild(div);
+  }
+  setupMediaObserver();
+}
+
+function renderAlbum() {
+  const grid = $('#albumGrid');
+  grid.innerHTML = '';
+  const filters = $('#albumFilters');
+  if (filters) {
+    const a = state.authors.a, b = state.authors.b;
+    filters.querySelector('[data-filter="a"]').textContent = a.name;
+    filters.querySelector('[data-filter="b"]').textContent = b.name;
+    filters.querySelectorAll('.chip-btn').forEach(btn => {
+      btn.classList.toggle('active', btn.dataset.filter === albumFilter);
+    });
+  }
+  let items = albumItems();
+  if (albumFilter !== 'all') items = items.filter(it => it.author === albumFilter);
+  if (!items.length) {
+    grid.innerHTML = '<div style="text-align:center;color:var(--ink-soft);padding:40px 0">暂无照片</div>';
+    return;
+  }
+  // 按 YYYY-MM 分组
+  const groups = new Map();
+  for (const it of items) {
+    const key = (it.date || '').slice(0, 7) || '未知';
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(it);
+  }
+  let globalIdx = 0;
+  for (const [month, list] of groups) {
+    const label = document.createElement('div');
+    label.className = 'album-month';
+    const [y, m] = month.split('-');
+    label.textContent = `${y}年${parseInt(m)}月`;
+    grid.appendChild(label);
+    for (const it of list) {
+      const cell = document.createElement('div');
+      cell.className = 'album-cell media-placeholder';
+      cell.dataset.mediaId = it.m.id;
+      cell.dataset.albumIdx = String(globalIdx);
+      const idx = globalIdx;
+      cell.addEventListener('click', () => openAlbumViewer(items, idx));
+      grid.appendChild(cell);
+      globalIdx++;
+    }
+  }
+  setupMediaObserver();
+}
+
+function openAlbum() {
+  renderAlbum();
+  $('#albumView').classList.remove('hidden');
+}
+function closeAlbum() {
+  $('#albumView').classList.add('hidden');
+}
+
+let viewerItems = [];
+let viewerIndex = 0;
+
+function openAlbumViewer(items, idx) {
+  viewerItems = items;
+  viewerIndex = idx;
+  showViewerItem();
+  $('#photoViewer').classList.remove('hidden');
+}
+
+async function showViewerItem() {
+  const it = viewerItems[viewerIndex];
+  if (!it) return;
+  const au = state.authors[it.author] || state.authors.a;
+  const info = $('#pvInfo');
+  info.innerHTML = `<span style="background:${esc(au.color)};color:#fff;padding:2px 8px;border-radius:10px;font-size:12px">${esc(au.name)}</span>
+    <span style="font-size:12px;color:var(--ink-soft);margin-left:6px">${esc(fmtStamp(it.m.createdAt || it.date))}</span>`;
+
+  const caption = $('#pvCaption');
+  if (it.source === 'entry') {
+    const entry = liveEntry(it.entryId);
+    caption.innerHTML = entry ? `来自日记《<a href="#" id="pvGoto" style="color:${esc(au.color)}">${esc(entry.title || entry.date)}</a>》` : '';
+  } else {
+    caption.textContent = '来自留言';
+  }
+  const goto = $('#pvGoto');
+  if (goto) goto.addEventListener('click', (ev) => { ev.preventDefault(); closeViewer(); closeAlbum(); gotoEntry(it.entryId); });
+
+  const img = $('#pvImg');
+  img.src = '';
+  img.alt = '';
+  try {
+    const buf = await getMediaBuf(it.m, 'f');
+    img.src = getObjectUrl(it.m.id + ':f', buf, it.m.mime);
+  } catch (e) {
+    img.alt = '加载失败';
+  }
+}
+
+function closeViewer() {
+  $('#photoViewer').classList.add('hidden');
+  viewerItems = [];
+}
+
+async function removeMedia() {
+  const it = viewerItems[viewerIndex];
+  if (!it) return;
+  const au = state.authors[it.author] || state.authors.a;
+  if (!confirm(`删除这张照片？\n\n${au.name} · ${fmtStamp(it.m.createdAt || it.date)}\n\n照片文件仍保留在仓库中，不会回收空间。`)) return;
+  const now = new Date().toISOString();
+  const entry = liveEntry(it.entryId);
+  if (!entry) { showToast('日记已不存在'); closeViewer(); return; }
+  if (it.commentId) {
+    const c = findComment(it.entryId, it.commentId);
+    if (c) {
+      const m = (c.media || []).find(x => x.id === it.m.id);
+      if (m) { m.deleted = true; m.deletedAt = now; m.updatedAt = now; }
+    }
+  } else {
+    const m = (entry.media || []).find(x => x.id === it.m.id);
+    if (m) { m.deleted = true; m.deletedAt = now; m.updatedAt = now; }
+  }
+  entry.updatedAt = now;
+  closeViewer();
+  render();
+  try {
+    await push('删除了一张照片');
+    showToast('照片已删除');
+  } catch (e) {
+    showConnBanner('删除失败：' + e.message);
+  }
+}
+
 function render() {
   if (!state) return;
   renderIdentity();
   renderCalendar();
   renderList();
+  renderAlbumWindow();
   renderSettingsInfo();
+  setupMediaObserver();
 }
 
 function renderIdentity() {
@@ -588,16 +1350,26 @@ function renderList() {
   for (const e of items) list.appendChild(entryCard(e));
 }
 
+/* ---------------- 照片条（懒加载占位） ---------------- */
+function mediaStripHtml(media, parentId, parentType) {
+  if (!media || !media.length) return '';
+  const cls = parentType === 'entry' ? 'e-media-strip' : 'c-media';
+  return `<div class="${cls}">${media.map((m, i) =>
+    `<div class="strip-thumb media-placeholder" data-media-id="${esc(m.id)}" data-parent="${esc(parentId)}" data-parent-type="${parentType}" data-idx="${i}"></div>`
+  ).join('')}</div>`;
+}
+
 function entryCard(e) {
   const au = state.authors[e.author];
   const card = document.createElement('article');
   card.className = 'entry';
+  card.dataset.id = e.id;   // 更新提醒要按 id 跳到某一篇，没这个就无从定位
   card.style.borderLeftColor = au.color;
 
   const rel = relLabel(e.date);
   const paras = String(e.content || '').split('\n');
   const parasHtml = paras.map((p, i) => {
-    const comments = (e.comments || []).filter(c => c.para === i);
+    const comments = (e.comments || []).filter(c => c.para === i && !c.deleted);
     return `<div class="para" data-para="${i}">
       <div class="para-text">${esc(p) || '&nbsp;'}</div>
       <div class="para-actions">
@@ -605,7 +1377,7 @@ function entryCard(e) {
       </div>
       <div class="para-comments">${comments.map(c => commentHtml(c)).join('')}</div>
       <div class="para-input hidden" data-input="${i}">
-        <input type="text" maxlength="500" placeholder="对这段话留言…">
+        <textarea rows="1" maxlength="500" placeholder="对这段话留言…"></textarea>
         <button class="send" data-para="${i}">发送</button>
       </div>
     </div>`;
@@ -619,6 +1391,7 @@ function entryCard(e) {
     </div>
     ${e.title ? `<div class="e-title" style="color:${esc(au.color)}">${esc(e.title)}</div>` : ''}
     <div class="e-content" style="color:${esc(au.color)}">${parasHtml}</div>
+    ${mediaStripHtml((e.media || []).filter(m => !m.deleted), e.id, 'entry')}
     <div class="e-meta">
       <span>${esc(clockTime(e.createdAt))} 写下${e.edited ? ` · ${esc(clockTime(e.updatedAt))} 编辑过` : ''}</span>
       <span class="spacer"></span>
@@ -629,37 +1402,69 @@ function entryCard(e) {
   card.querySelector('[data-act="edit"]').addEventListener('click', () => openCompose(e));
   card.querySelector('[data-act="del"]').addEventListener('click', () => removeEntry(e));
 
+  card.querySelectorAll('.comment [data-cact]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const cid = btn.closest('.comment').dataset.cid;
+      if (btn.dataset.cact === 'del') removeComment(e.id, cid);
+      else beginEditComment(card, e.id, cid);
+    });
+  });
+
   card.querySelectorAll('.para-comment-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       const row = card.querySelector(`.para-input[data-input="${btn.dataset.para}"]`);
       row.classList.toggle('hidden');
-      if (!row.classList.contains('hidden')) row.querySelector('input').focus();
+      if (!row.classList.contains('hidden')) {
+        const ta = row.querySelector('textarea');
+        autoGrow(ta);
+        ta.focus();
+      }
     });
   });
   card.querySelectorAll('.para-input .send').forEach(btn => {
     const submit = async () => {
       const row = btn.closest('.para-input');
-      const input = row.querySelector('input');
-      const text = input.value.trim();
+      const ta = row.querySelector('textarea');
+      const text = ta.value.trim();
       if (!text) return;
+      ta.value = '';
       await addComment(e, parseInt(btn.dataset.para, 10), text);
     };
     btn.addEventListener('click', submit);
-    btn.parentElement.querySelector('input').addEventListener('keydown', (ev) => {
-      if (ev.key === 'Enter') { ev.preventDefault(); submit(); }
+    btn.parentElement.querySelector('textarea').addEventListener('keydown', (ev) => {
+      // 中文输入法按 Enter 是在选字（isComposing / keyCode 229），不拦住就会把半句话发出去。
+      if (ev.isComposing || ev.keyCode === 229) return;
+      if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); submit(); }
+    });
+    btn.parentElement.querySelector('textarea').addEventListener('input', (ev) => autoGrow(ev.target));
+  });
+
+  card.querySelectorAll('.strip-thumb[data-media-id]').forEach(thumb => {
+    thumb.addEventListener('click', () => {
+      const allMedia = (e.media || []).filter(m => !m.deleted);
+      const items = allMedia.map((m, i) => ({ m, entryId: e.id, date: e.date, author: m.author || e.author, source: 'entry' }));
+      const idx = items.findIndex(it => it.m.id === thumb.dataset.mediaId);
+      if (idx >= 0) openAlbumViewer(items, idx);
     });
   });
+
   return card;
 }
 
 function commentHtml(c) {
   const au = state.authors[c.author];
-  return `<div class="comment" style="border-left-color:${esc(au.color)}">
+  // 只有作者本人能改自己的留言：留言是对方写给我的话，我无权代改。
+  const mine = c.author === me;
+  return `<div class="comment" data-cid="${esc(c.id)}" style="border-left-color:${esc(au.color)}">
     <div class="c-head">
       <span class="c-author" style="color:${esc(au.color)}">${esc(au.name)}</span>
-      <span class="c-time">${esc(fmtStamp(c.createdAt))}</span>
+      <span class="c-time">${esc(fmtStamp(c.createdAt))}${c.edited ? ' · 已编辑' : ''}</span>
+      ${mine ? `<span class="spacer"></span>
+      <button class="c-act" data-cact="edit">编辑</button>
+      <button class="c-act del" data-cact="del">删除</button>` : ''}
     </div>
     <div class="c-text">${esc(c.text)}</div>
+    ${mediaStripHtml((c.media || []).filter(m => !m.deleted), c.id, 'comment')}
   </div>`;
 }
 
@@ -678,20 +1483,129 @@ function fmtStamp(iso) {
 async function addComment(e, paraIdx, text) {
   // 卡片闭包里的 e 可能已经被一次同步换成了新对象，必须按 id 取回 state 里的那一条，
   // 否则留言写进了游离对象，push 上去的数据里根本没有它。
-  const target = (state.entries || []).find(x => x.id === e.id);
+  const target = liveEntry(e.id);
   if (!target) { showToast('这篇日记刚刚被改动了，请再试一次'); render(); return; }
+  const now = new Date().toISOString();
   target.comments = mergeComments(target.comments, [normComment({
-    id: newId(), para: paraIdx, author: me, text, createdAt: new Date().toISOString()
+    id: newId(), para: paraIdx, author: me, text: text, createdAt: now
   })]);
-  target.updatedAt = new Date().toISOString();
+  target.updatedAt = now;
   state.entries = sortEntries(state.entries);
   render();
+  openParaInput(target.id, paraIdx);
   try {
     await push(`留言于 ${target.date} 的日记`);
     showToast('留言已发送');
     render();
+    openParaInput(target.id, paraIdx);
   } catch (err) {
     showConnBanner('留言失败：' + err.message);
+  }
+}
+
+/* ---------------- 留言编辑 / 删除 ---------------- */
+// 下面每一个改动都先按 id 从 state 里重取对象，绝不碰卡片闭包里的引用 ——
+// 一次静默同步就可能把它换成游离对象，写进去等于没写（这个坑已经踩过一次）。
+function liveEntry(id) {
+  return (state && state.entries || []).find(x => x.id === id) || null;
+}
+function findComment(entryId, cid) {
+  const t = liveEntry(entryId);
+  if (!t) return null;
+  return (t.comments || []).find(c => c.id === cid) || null;
+}
+function autoGrow(ta) {
+  ta.style.height = 'auto';
+  ta.style.height = Math.min(ta.scrollHeight, 120) + 'px';
+}
+function openParaInput(entryId, para, focus) {
+  const row = document.querySelector(`.entry[data-id="${entryId}"] .para-input[data-input="${para}"]`);
+  if (!row) return;
+  row.classList.remove('hidden');
+  const ta = row.querySelector('textarea');
+  autoGrow(ta);
+  // focus 只在用户主动点「留言」时为真：发完之后强行拉起手机键盘反而烦人。
+  if (focus) ta.focus();
+}
+
+function beginEditComment(card, entryId, cid) {
+  const c = findComment(entryId, cid);
+  if (!c) { render(); return; }
+  // 用遍历而不是 CSS 选择器定位：id 内容不必假设对选择器安全。
+  const node = [...card.querySelectorAll('.comment')].find(n => n.dataset.cid === cid);
+  if (!node || node.querySelector('textarea')) return;
+
+  const ta = document.createElement('textarea');
+  ta.className = 'c-edit';
+  ta.maxLength = 500;
+  ta.value = c.text;
+  const row = document.createElement('div');
+  row.className = 'c-edit-act';
+  row.innerHTML = `<button class="c-act" data-save>保存</button><button class="c-act" data-cancel>取消</button>`;
+  node.querySelector('.c-text').replaceWith(ta);
+  node.appendChild(row);
+  node.querySelectorAll('[data-cact]').forEach(b => { b.disabled = true; });
+  autoGrow(ta);
+  ta.focus();
+  ta.setSelectionRange(ta.value.length, ta.value.length);
+
+  const save = () => saveCommentEdit(entryId, cid, ta.value);
+  const cancel = () => render();
+  row.querySelector('[data-save]').addEventListener('click', save);
+  row.querySelector('[data-cancel]').addEventListener('click', cancel);
+  ta.addEventListener('input', () => autoGrow(ta));
+  ta.addEventListener('keydown', (ev) => {
+    if (ev.isComposing || ev.keyCode === 229) return;
+    if (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey)) { ev.preventDefault(); save(); }
+    else if (ev.key === 'Escape') cancel();
+  });
+}
+
+async function saveCommentEdit(entryId, cid, text) {
+  text = String(text || '').trim();
+  const c = findComment(entryId, cid);
+  const target = liveEntry(entryId);
+  if (!c || !target) { showToast('这条留言刚刚被改动了，请再试一次'); render(); return; }
+  if (!text) { showToast('留言不能是空的'); return; }
+  if (text === c.text) { render(); return; }
+  const now = new Date().toISOString();
+  c.text = text.slice(0, 500);
+  c.edited = true;
+  c.updatedAt = now;          // LWW 靠这个时间戳决定谁的版本活下来
+  target.updatedAt = now;
+  render();
+  openParaInput(target.id, c.para);
+  try {
+    await push(`编辑了 ${target.date} 日记里的一条留言`);
+    showToast('留言已更新');
+    render();
+    openParaInput(target.id, c.para);
+  } catch (err) {
+    showConnBanner('保存失败：' + err.message);
+  }
+}
+
+async function removeComment(entryId, cid) {
+  const c = findComment(entryId, cid);
+  const target = liveEntry(entryId);
+  if (!c || !target) { render(); return; }
+  const who = state.authors[c.author].name;
+  const brief = c.text.length > 40 ? c.text.slice(0, 40) + '…' : c.text;
+  if (!confirm(`删除这条留言？\n\n${who}：${brief}`)) return;
+  const now = new Date().toISOString();
+  // 只打墓碑，不真删：对方设备上的旧副本要靠它来判负，硬删会让留言在下次合并时复活。
+  c.deleted = true;
+  c.deletedAt = now;
+  c.updatedAt = now;
+  target.updatedAt = now;
+  state.entries = sortEntries(state.entries);
+  render();
+  try {
+    await push(`删除了 ${target.date} 日记里的一条留言`);
+    showToast('留言已删除');
+    render();
+  } catch (err) {
+    showConnBanner('删除失败：' + err.message);
   }
 }
 
@@ -738,36 +1652,89 @@ function paintAuthorOpts() {
 function openCompose(entry) {
   editingId = entry ? entry.id : null;
   composeAuthor = entry ? entry.author : me;
+  pendingMedia = [];
   $('#composeHeading').textContent = entry ? '编辑日记' : '写日记';
   $('#fDate').value = entry ? entry.date : (viewMode === 'day' ? selectedDate : todayKey());
   $('#fTitle').value = entry ? entry.title : '';
   $('#fContent').value = entry ? entry.content : '';
+  $('#fMedia').value = '';
+  paintComposePending();
+  hideUploadStatus();
   paintAuthorOpts();
   $('#composeSheet').classList.remove('hidden');
   setTimeout(() => $('#fContent').focus(), 60);
 }
-function closeCompose() { $('#composeSheet').classList.add('hidden'); }
+function closeCompose() {
+  for (const pm of pendingMedia) { if (pm.preview) URL.revokeObjectURL(pm.preview); }
+  pendingMedia = [];
+  $('#composeSheet').classList.add('hidden');
+}
+
+function paintComposePending() {
+  const box = $('#composePending');
+  box.innerHTML = '';
+  for (let i = 0; i < pendingMedia.length; i++) {
+    const pm = pendingMedia[i];
+    const div = document.createElement('div');
+    div.className = 'pending-thumb';
+    const img = document.createElement('img');
+    img.src = pm.preview;
+    div.appendChild(img);
+    const rm = document.createElement('button');
+    rm.className = 'pending-rm';
+    rm.textContent = '✕';
+    rm.addEventListener('click', () => { if (pm.preview) URL.revokeObjectURL(pm.preview); pendingMedia.splice(i, 1); paintComposePending(); });
+    div.appendChild(rm);
+    box.appendChild(div);
+  }
+}
+function showUploadStatus(text, isError) {
+  const el = $('#composeUploadStatus');
+  el.textContent = text;
+  el.classList.toggle('error', !!isError);
+  el.classList.remove('hidden');
+}
+function hideUploadStatus() { $('#composeUploadStatus').classList.add('hidden'); }
 
 async function saveCompose() {
   const content = $('#fContent').value.trim();
-  if (!content) { showToast('正文不能为空'); return; }
+  if (!content && !pendingMedia.length && !(editingId && liveEntry(editingId) && (liveEntry(editingId).media || []).filter(m => !m.deleted).length)) {
+    showToast('正文不能为空，或至少添加一张照片'); return;
+  }
   const date = $('#fDate').value || todayKey();
   const title = $('#fTitle').value.trim();
   const now = new Date().toISOString();
 
+  let newMediaItems = [];
+  if (pendingMedia.length) {
+    showUploadStatus('正在上传 ' + pendingMedia.length + ' 张照片…');
+    const result = await putMediaFiles(pendingMedia.map(p => p.file));
+    newMediaItems = result.items;
+    if (result.errors.length) {
+      showUploadStatus('部分照片上传失败：' + result.errors.join('；'), true);
+      if (!newMediaItems.length) return;
+    }
+  }
+
   if (editingId) {
-    const e = (state.entries || []).find(x => x.id === editingId);
+    const e = liveEntry(editingId);
     if (!e) { showToast('这篇日记已不存在'); closeCompose(); return; }
     e.date = date; e.title = title; e.content = content;
     e.author = composeAuthor;
     e.updatedAt = now; e.edited = true;
+    if (newMediaItems.length) {
+      e.media = mergeMedia(e.media || [], newMediaItems);
+    }
   } else {
-    state.entries = sortEntries([...(state.entries || []), normEntry({
+    const entry = normEntry({
       id: newId(), date, title, content, author: composeAuthor,
-      createdAt: now, updatedAt: now, edited: false
-    })]);
+      createdAt: now, updatedAt: now, edited: false,
+      media: newMediaItems
+    });
+    state.entries = sortEntries([...(state.entries || []), entry]);
   }
   state.entries = sortEntries(state.entries);
+  hideUploadStatus();
   closeCompose();
   render();
   try {
@@ -847,6 +1814,7 @@ function resetConn() {
   if (!confirm('清除这台设备上的令牌与缓存？日记数据仍在 GitHub 仓库里。')) return;
   localStorage.removeItem(LS_CFG);
   localStorage.removeItem(LS_CACHE);
+  localStorage.removeItem(LS_SEEN);
   try { sessionStorage.removeItem(SS_UNLOCK); } catch (e) { /* ignore */ }
   location.reload();
 }
@@ -896,6 +1864,7 @@ async function connect(owner, repo, token) {
   }
   localStorage.setItem(LS_CFG, JSON.stringify(cfg));
   saveCache();
+  seedSeen();
 }
 
 async function boot() {
@@ -907,6 +1876,7 @@ async function boot() {
 
   if (!(cfg && cfg.token)) { showSetup(); return; }
 
+  seedSeen();
   state = cached ? cached.state : defaultState();
   if (cached) remoteSha = cached.sha;
 
@@ -924,6 +1894,14 @@ async function boot() {
     render();
     startPolling();
     if (changed && !cached) showToast('已连接');
+    // 启动后刷一次红点，但不弹 toast、不推进 seen
+    if (changed) {
+      const since = seenStamp();
+      if (since && !seenSeededThisBoot) {
+        const events = collectEvents(since);
+        paintBadge(events.length);
+      }
+    }
   } catch (e) {
     if (cached) {
       showConnBanner('连接失败：' + e.message + '（显示的是本机缓存）');
@@ -993,9 +1971,49 @@ function bind() {
   $('#pickA').addEventListener('click', () => { composeAuthor = 'a'; paintAuthorOpts(); });
   $('#pickB').addEventListener('click', () => { composeAuthor = 'b'; paintAuthorOpts(); });
 
+  $('#fMedia').addEventListener('change', (ev) => {
+    const files = ev.target.files;
+    if (!files || !files.length) return;
+    for (const f of files) {
+      pendingMedia.push({ file: f, preview: URL.createObjectURL(f) });
+    }
+    ev.target.value = '';
+    paintComposePending();
+  });
+
   $('#settingsBtn').addEventListener('click', () => { renderSettingsInfo(); $('#settingsSheet').classList.remove('hidden'); });
   $('#closeSettings').addEventListener('click', () => $('#settingsSheet').classList.add('hidden'));
   $('#settingsSheet').addEventListener('click', (ev) => { if (ev.target === ev.currentTarget) $('#settingsSheet').classList.add('hidden'); });
+
+  $('#notifBtn').addEventListener('click', () => openNotifSheet());
+  $('#closeNotif').addEventListener('click', () => $('#notifSheet').classList.add('hidden'));
+  $('#notifSheet').addEventListener('click', (ev) => { if (ev.target === ev.currentTarget) $('#notifSheet').classList.add('hidden'); });
+
+  $('#albumBtn').addEventListener('click', openAlbum);
+  $('#closeAlbum').addEventListener('click', closeAlbum);
+  $('#albumWinAll').addEventListener('click', openAlbum);
+  $('#albumFilters').addEventListener('click', (ev) => {
+    const btn = ev.target.closest('[data-filter]');
+    if (!btn) return;
+    albumFilter = btn.dataset.filter;
+    renderAlbum();
+  });
+
+  $('#closeViewer').addEventListener('click', closeViewer);
+  $('#pvDelete').addEventListener('click', removeMedia);
+  $('#photoViewer').addEventListener('click', (ev) => { if (ev.target === ev.currentTarget || ev.target.id === 'pvBody') closeViewer(); });
+
+  // 滑动切换照片：pointerdown/pointerup 水平阈值 40px
+  let pvSwipeX = null;
+  $('#pvBody').addEventListener('pointerdown', (ev) => { pvSwipeX = ev.clientX; });
+  $('#pvBody').addEventListener('pointerup', (ev) => {
+    if (pvSwipeX == null) return;
+    const dx = ev.clientX - pvSwipeX;
+    pvSwipeX = null;
+    if (Math.abs(dx) < 40) return;
+    if (dx < 0 && viewerIndex < viewerItems.length - 1) { viewerIndex++; showViewerItem(); }
+    else if (dx > 0 && viewerIndex > 0) { viewerIndex--; showViewerItem(); }
+  });
 
   $('#saveNames').addEventListener('click', saveNames);
   $('#setAsA').addEventListener('click', () => { me = 'a'; localStorage.setItem(LS_ME, me); render(); });
@@ -1040,3 +2058,29 @@ function bind() {
 
 bind();
 boot();
+
+// 测试暴露：只在模拟环境（_mock.js 已加载）下把内部函数挂到 window，供 evaluate_script 验证。
+if (window.__mock) {
+  window.__test = {
+    normEntry, normComment, normMedia,
+    mergeComments, mergeMedia, mergeStates,
+    stableCommentId, fnv1a, lwwMerge,
+    pruneTombstones,
+    liveEntries, liveEntry, findComment,
+    collectEvents, seenStamp, paintBadge,
+    bufToB64, b64ToBuf, fmtBytes,
+    compressPhoto, compressToBlob, compressThumb,
+    putMediaOne, putMediaFiles,
+    getMediaBuf, idbPut, idbGet, getObjectUrl,
+    semAcquire, semRelease,
+    albumItems, findMediaItem, mediaStripHtml,
+    renderAlbum, renderAlbumWindow, openAlbum, closeAlbum,
+    openAlbumViewer, closeViewer, removeMedia, setupMediaObserver,
+    getState: function () { return state; },
+    setState: function (s) { state = s; },
+    getCfg: function () { return cfg; },
+    setCfg: function (c) { cfg = c; },
+    getMe: function () { return me; },
+    setMe: function (m) { me = m; }
+  };
+}
