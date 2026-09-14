@@ -1174,6 +1174,7 @@ function closeAlbum() {
 
 let viewerItems = [];
 let viewerIndex = 0;
+let viewerSeq = 0;
 
 function openAlbumViewer(items, idx) {
   viewerItems = items;
@@ -1182,9 +1183,20 @@ function openAlbumViewer(items, idx) {
   $('#photoViewer').classList.remove('hidden');
 }
 
+function viewerStep(d) {
+  const next = viewerIndex + d;
+  if (next < 0 || next >= viewerItems.length) return;
+  viewerIndex = next;
+  showViewerItem();
+}
+
 async function showViewerItem() {
   const it = viewerItems[viewerIndex];
   if (!it) return;
+  const seq = ++viewerSeq;
+  $('#pvCount').textContent = (viewerIndex + 1) + ' / ' + viewerItems.length;
+  $('#pvPrev').classList.toggle('hidden', viewerIndex <= 0);
+  $('#pvNext').classList.toggle('hidden', viewerIndex >= viewerItems.length - 1);
   const au = state.authors[it.author] || state.authors.a;
   const info = $('#pvInfo');
   info.innerHTML = `<span style="background:${esc(au.color)};color:#fff;padding:2px 8px;border-radius:10px;font-size:12px">${esc(au.name)}</span>
@@ -1205,8 +1217,10 @@ async function showViewerItem() {
   img.alt = '';
   try {
     const buf = await getMediaBuf(it.m, 'f');
+    if (seq !== viewerSeq) return;
     img.src = getObjectUrl(it.m.id + ':f', buf, it.m.mime);
   } catch (e) {
+    if (seq !== viewerSeq) return;
     img.alt = '加载失败';
   }
 }
@@ -2001,6 +2015,13 @@ function bind() {
 
   $('#closeViewer').addEventListener('click', closeViewer);
   $('#pvDelete').addEventListener('click', removeMedia);
+  $('#pvPrev').addEventListener('click', () => viewerStep(-1));
+  $('#pvNext').addEventListener('click', () => viewerStep(1));
+  document.addEventListener('keydown', (ev) => {
+    if ($('#photoViewer').classList.contains('hidden')) return;
+    if (ev.key === 'ArrowLeft') viewerStep(-1);
+    else if (ev.key === 'ArrowRight') viewerStep(1);
+  });
   $('#photoViewer').addEventListener('click', (ev) => { if (ev.target === ev.currentTarget || ev.target.id === 'pvBody') closeViewer(); });
 
   // 滑动切换照片：pointerdown/pointerup 水平阈值 40px
@@ -2011,8 +2032,7 @@ function bind() {
     const dx = ev.clientX - pvSwipeX;
     pvSwipeX = null;
     if (Math.abs(dx) < 40) return;
-    if (dx < 0 && viewerIndex < viewerItems.length - 1) { viewerIndex++; showViewerItem(); }
-    else if (dx > 0 && viewerIndex > 0) { viewerIndex--; showViewerItem(); }
+    viewerStep(dx < 0 ? 1 : -1);
   });
 
   $('#saveNames').addEventListener('click', saveNames);
